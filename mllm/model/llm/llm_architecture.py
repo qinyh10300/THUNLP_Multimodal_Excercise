@@ -228,13 +228,17 @@ class LLMAttention(nn.Module):
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
         bsz, q_len, _ = hidden_states.size()
+        # bsz means batchsize
 
         ### ===> TODO: 计算多头注意力中的 Query，Key，Value
         ## 1. 将原始 Q、K、V 进行映射
+        query_states = self.q_proj(hidden_states)    # shape: [batchsize, q_len, num_heads * head_dim]
+        key_states = self.k_proj(hidden_states)      # shape: [batchsize, q_len, num_key_value_heads * head_dim]
+        value_states = self.v_proj(hidden_states)    # shape: [batchsize, q_len, num_key_value_heads * head_dim]
         ## 2. 将映射后的 Q、K、V 整理为多头注意力的形状
-        query_states = None
-        key_states = None
-        value_states = None
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)    # shape: [batchsize, num_heads, q_len, head_dim]
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)    # shape: [batchsize, num_key_value_heads, q_len, head_dim]
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)    # shape: [batchsize, num_key_value_heads, q_len, head_dim]
         ### <===
 
         kv_seq_len = key_states.shape[-2]
@@ -258,16 +262,47 @@ class LLMAttention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         ### ==> TODO: 计算注意力机制中的加权权重，应用注意力掩码
-        attn_weights = None
+        # [batch_size, num_heads, q_len, head_dim] x [batch_size, num_heads, head_dim, kv_len]
+        # -> [batch_size, num_heads, q_len, kv_len]
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        # 使用注意力掩码
+        if attention_mask is not None:
+            # attention_mask.shape = [batch_size, 1, 1, seq_len] for broadcasting
+            # mask == 0 的位置替换为-inf, 后面softmax之后为0
+            attention_mask = attention_mask[:, None, None, :]  # shape: [batch_size, 1, 1, seq_len]
+            attn_weights = attn_weights.masked_fill(attention_mask == 0, float("-inf"))
+
+        # 使用因果掩码
+        if self.is_causal:
+            q_len, kv_len = query_states.shape[-2], key_states.shape[-1]
+            causal_mask = torch.tril(torch.ones((q_len, kv_len), dtype=torch.bool, device=attn_weights.device))
+            attn_weights = attn_weights.masked_fill(~causal_mask, float("-inf"))
+
+        # softmax将注意力分数转换为概率权重
+        attn_weights = F.softmax(attn_weights, dim = -1)
         ### <===
 
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
 
         ### ===> TODO: 计算注意力输出取值
+
         ## 1. 对 Value 值进行加权
+        # attn_weights.shape = [batch_size, num_heads, q_len, kv_len]
+        # value_states.shape = [batch_size, num_heads, kv_len, head_dim]
+        attn_output = torch.matnul(attn_weights, value_states)
+        # attn_output.shape = [batch_size, num_heads, q_len, head_dim]
+
         ## 2. 合并多头注意力取值
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        # attn_output.shape = [batch_size, q_len, num_heads, head_dim]
+        attn_output = attn_output.view(bsz, q_len, self.num_heads * self.head_dim)
+        # attn_output.shape = [batch_size, num_heads, num_heads * head_dim]
+
         ## 3. 将输出进行映射
-        attn_output = None
+        attn_output = self.o_proj(attn_output)
+        # attn_output.shape = [batch_size, num_heads, hidden_size]
+
         ### <===
 
         if not output_attentions:
